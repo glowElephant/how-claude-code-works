@@ -26,6 +26,9 @@
 - **落地实践**
   - [15. 最小必要组件](/docs/13-minimal-components.md)
 
+- **运行观测**
+  - [16. 可观测性：Metrics 与 Trace](/docs/16-observability.md)
+
 - **参考**
   - [速查参考](/docs/reference.md)
 

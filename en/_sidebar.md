@@ -26,6 +26,9 @@
 - **Practical Implementation**
   - [15. Minimal Essential Components](/en/docs/13-minimal-components.md)
 
+- **Runtime Observability**
+  - [16. Observability: Metrics & Traces](/en/docs/16-observability.md)
+
 - **Reference**
   - [Quick Reference](/en/docs/reference.md)
 
