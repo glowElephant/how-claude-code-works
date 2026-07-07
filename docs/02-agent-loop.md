@@ -10,7 +10,7 @@
 用户输入 → 上下文组装 → 模型决策 → 工具执行 → 结果注入 → 继续/停止
 ```
 
-这个循环不断重复，直到模型决定不再调用工具——返回纯文本响应为止。这就是 Agent Loop（代理循环）的本质。
+这个循环不断重复，直到模型决定不再调用工具——返回纯文本响应为止。这就是 Agent Loop（代理循环）。
 
 ## 2.2 双层生成器架构
 
@@ -42,7 +42,7 @@ graph TB
 | 预算追踪 | USD/轮次检查，结构化输出重试 | Task Budget 跨压缩结转，Token 预算续写 |
 | 恢复策略 | 权限拒绝、孤儿权限 | PTL 排水/压缩、max_output_tokens 升级/重试 |
 
-为什么要分两层？因为**会话管理和查询执行的关注点完全不同**。QueryEngine 关心的是"用户说了什么、花了多少钱、这轮结果是否成功"；query() 关心的是"消息是否需要压缩、API 返回了什么、工具执行是否成功、是否需要恢复"。双层分离使得每层的代码都更聚焦、更容易测试。
+为什么要分两层？因为会话管理和查询执行的关注点完全不同。QueryEngine 关心的是"用户说了什么、花了多少钱、这轮结果是否成功"；query() 关心的是"消息是否需要压缩、API 返回了什么、工具执行是否成功、是否需要恢复"。双层分离使得每层的代码都更聚焦、更容易测试。
 
 ## 2.3 QueryEngine：会话生命周期管理
 
@@ -86,9 +86,9 @@ export type QueryEngineConfig = {
 
 几个值得注意的设计细节：
 
-- **`canUseTool` 包装**：`submitMessage()` 内部会包装这个函数，在原有权限检查基础上追踪所有权限拒绝事件。这些拒绝记录最终会在结果消息中返回给 SDK 消费者（如桌面应用），让它们知道用户拒绝了哪些操作
-- **`readFileCache`**：避免重复回传同一个文件的全文。如果模型在第 3 轮调用 `FileReadTool` 读了 `src/query.ts`，第 5 轮再次请求**同一文件的同一范围**、且文件在磁盘上未改动（仍会 stat 校验 mtime）时，返回的是一个 `file_unchanged` 存根而不是重发全文——那次 Read 的结果还留在上下文里，重发只会白白重复消耗 `cache_creation` token
-- **`orphanedPermission`**：处理一种边缘情况——上一次会话在用户授权"始终允许 BashTool"后崩溃，权限没有持久化。下次启动时，这个"孤儿权限"会被重放一次
+- `canUseTool` 包装：`submitMessage()` 内部会包装这个函数，在原有权限检查基础上追踪所有权限拒绝事件。这些拒绝记录最终会在结果消息中返回给 SDK 消费者（如桌面应用），让它们知道用户拒绝了哪些操作
+- `readFileCache`：避免重复回传同一个文件的全文。如果模型在第 3 轮调用 `FileReadTool` 读了 `src/query.ts`，第 5 轮再次请求同一文件的同一范围、且文件在磁盘上未改动（仍会 stat 校验 mtime）时，返回的是一个 `file_unchanged` 存根而不是重发全文——那次 Read 的结果还留在上下文里，重发只会白白重复消耗 `cache_creation` token
+- `orphanedPermission`：处理一种边缘情况——上一次会话在用户授权"始终允许 BashTool"后崩溃，权限没有持久化。下次启动时会把这个"孤儿权限"重放一次
 
 ### submitMessage() 八阶段生命周期
 
@@ -108,37 +108,37 @@ flowchart TD
     Budget -->|通过| Result[8. 结果提取<br/>isResultSuccessful<br/>textResult提取<br/>yield最终结果消息]
 ```
 
-**各阶段详解**：
+逐阶段展开：
 
-**阶段 1 — 设置**：为什么每轮开头都要清空技能发现追踪集合（`discoveredSkillNames.clear()`）？这个 Set 记录本轮发现过的技能名，用于喂给 `tengu_skill_tool_invocation` 遥测里的 `was_discovered` 标记；它需要跨一次 `submitMessage` 内的两次 `processUserInputContext` 重建存活，但每次 `submitMessage` 开头都清空，是为了避免 SDK 模式下多轮会话里这个集合无限增长。
+阶段 1 — 设置：为什么每轮开头都要清空技能发现追踪集合（`discoveredSkillNames.clear()`）？这个 Set 记录本轮发现过的技能名，用于喂给 `tengu_skill_tool_invocation` 遥测里的 `was_discovered` 标记；它需要跨一次 `submitMessage` 内的两次 `processUserInputContext` 重建存活，但每次 `submitMessage` 开头都清空，是为了避免 SDK 模式下多轮会话里这个集合无限增长。
 
-**阶段 2 — 孤儿权限**：只在会话的第一次 `submitMessage()` 调用时触发，且只触发一次（`orphanedPermission` 使用后被清空）。这处理的是上一个会话崩溃后遗留的权限授权。
+阶段 2 — 孤儿权限：只在会话的第一次 `submitMessage()` 调用时触发，且只触发一次（`orphanedPermission` 用过即清空）。这处理的是上一个会话崩溃后遗留的权限授权。
 
-**阶段 3 — 用户输入处理**：`processUserInput()` 是一个复杂的函数，它需要：
+阶段 3 — 用户输入处理：`processUserInput()` 是一个复杂的函数，它需要：
 - 解析斜杠命令（`/compact` 触发手动压缩、`/memory` 管理记忆等）
 - 处理附件（图片、PDF、文件引用）
 - 将处理后的消息推入 `mutableMessages` 并持久化到磁盘
 
-**阶段 5 — 本地命令检查**：像 `/clear` 这样的命令不需要调用 API——它们只是清理本地状态。如果 `processUserInput()` 设置了 `shouldQuery = false`，直接 yield 命令输出并提前返回，跳过整个查询循环。
+阶段 5 — 本地命令检查：像 `/clear` 这样的命令不需要调用 API——它们只是清理本地状态。如果 `processUserInput()` 设置了 `shouldQuery = false`，直接 yield 命令输出并提前返回，跳过整个查询循环。
 
-**阶段 6 — 主查询循环**：这是最复杂的阶段。`for await (const msg of query(params))` 迭代查询生成器，`switch (message.type)` 分派 9 类消息：
+阶段 6 — 主查询循环：这是最复杂的阶段。`for await (const msg of query(params))` 迭代查询生成器，`switch (message.type)` 分派 9 类消息：
 - `tombstone`：消息删除控制信号，跳过不处理
 - `assistant` 消息：推入消息列表并 yield 给上层
 - `progress` 消息：行内进度记录
 - `user` 消息：工具结果注入
 - `stream_event`：流式事件，内含 `message_start` / `message_delta` / `message_stop`，用于更新 Token 使用统计
-- `attachment`：提取结构化输出（`StructuredOutput`），并承载 `max_turns_reached` 终止信号（yield 一条 `error_max_turns` 结果后直接返回）
+- `attachment`：提取结构化输出 `StructuredOutput`，并承载 `max_turns_reached` 终止信号——收到即 yield 一条 `error_max_turns` 结果并直接返回
 - `stream_request_start`：请求开始信号，跳过不处理
-- `system`：含 `compact_boundary`（触发 snip/splice/GC 清理）与 `api_error`（yield 重试信号）两个子类型
+- `system`：两个子类型——`compact_boundary` 触发 snip/splice/GC 清理，`api_error` 则 yield 重试信号
 - `tool_use_summary`：工具使用摘要
 
-**阶段 7 — 预算检查**：两种预算限制——USD 成本（`getTotalCost() >= maxBudgetUsd`）和结构化输出重试次数（最多 5 次）。
+阶段 7 — 预算检查：两种预算限制，一是 USD 成本，触线条件是 `getTotalCost() >= maxBudgetUsd`；二是结构化输出重试次数，最多 5 次。
 
-**阶段 8 — 结果提取**：`isResultSuccessful()` 检查最后一条 assistant 消息是否有效。最终 yield 的结果消息包含丰富的元数据：usage（Token 使用量）、cost（USD 成本）、turns（工具调用轮次）、stop_reason、permission_denials（被拒绝的权限列表）等。
+阶段 8 — 结果提取：`isResultSuccessful()` 检查最后一条 assistant 消息是否有效。最终 yield 的结果消息带一整套元数据：usage 是 Token 使用量，cost 是 USD 成本，turns 是工具调用轮次，另有 stop_reason、permission_denials（用户拒绝过的权限）等字段。
 
 ## 2.4 query()：核心循环的实现
 
-`src/query.ts`（1,729 行）是 Claude Code 最复杂的单个模块，实现了一个**基于状态机的异步生成器循环**。
+`src/query.ts`（1,729 行）是 Claude Code 最复杂的单个模块，实现了一个基于状态机的异步生成器循环。
 
 ### 核心签名
 
@@ -155,7 +155,7 @@ export async function* query(
 >
 ```
 
-关键点：这是一个 `async function*`——异步生成器。它不是一次性返回结果，而是**边执行边 yield 事件**，使调用方可以实时渲染流式输出。
+关键点：这是一个 `async function*`——异步生成器。它不是一次性返回结果，而是边执行边 yield 事件，使调用方可以实时渲染流式输出。
 
 ### 循环状态
 
@@ -197,7 +197,7 @@ async function* queryLoop(params: QueryParams, consumedCommandUuids: string[]) {
 }
 ```
 
-`params` 中的字段在循环期间是常量；`state` 在每个 continue site 通过整体赋值更新（而不是逐字段修改），这让状态变更更加明确和可追踪。
+`params` 中的字段在循环期间是常量；`state` 在每个 continue site 通过整体赋值更新，而不是逐字段修改——这让状态变更更加明确和可追踪。
 
 ### 单次循环迭代流程
 
@@ -222,11 +222,11 @@ flowchart TD
 
 ### 循环体代码走读
 
-让我们跟着代码走一遍循环体的关键步骤：
+跟着代码走一遍循环体的关键步骤：
 
-**第一步：4 级压缩流水线**（详见[第 3 章](./03-context-engineering.md)）
+第一步：4 级压缩流水线（详见[第 3 章](./03-context-engineering.md)）
 
-每次循环迭代的入口处，消息列表依次经过 Tool Result Budget → Snip → Microcompact → Context Collapse → Autocompact。这是防御性设计——即使上一轮工具返回了 100K Token 的输出，压缩流水线会在 API 调用前将其控制在预算内。
+每次循环迭代的入口处，消息列表依次经过 Tool Result Budget、Snip、Microcompact、Context Collapse、Autocompact。这是防御性设计——即使上一轮工具返回了 100K Token 的输出，压缩流水线会在 API 调用前将其控制在预算内。
 
 ```typescript
 // 1. Tool Result 预算裁剪
@@ -252,7 +252,7 @@ if (feature('CONTEXT_COLLAPSE') && contextCollapse) {
 }
 ```
 
-**第二步：构建 API 请求**
+第二步：构建 API 请求
 
 ```typescript
 const fullSystemPrompt = asSystemPrompt(
@@ -261,13 +261,13 @@ const fullSystemPrompt = asSystemPrompt(
 // userContext 通过 prependUserContext() 前置于消息
 ```
 
-上下文的注入顺序对提示词缓存有影响：系统提示词（较稳定）后置追加系统上下文（Git 状态等），用户上下文（CLAUDE.md、日期）前置于消息。这种安排让系统提示词部分能更高效地被缓存。
+上下文的注入顺序对提示词缓存有影响：系统提示词相对稳定，Git 状态这类系统上下文追加在它末尾；CLAUDE.md、日期这类用户上下文则前置于消息。这种安排让系统提示词部分更容易命中缓存。
 
-**第三步：流式调用 + 工具并行执行**
+第三步：流式调用 + 工具并行执行
 
 `callModel()` 返回一个 async generator，`StreamingToolExecutor` 在流式接收响应的同时就开始执行已完成的工具调用（详见 2.4.1 节）。
 
-**第四步：记忆预取消费**
+第四步：记忆预取消费
 
 ```typescript
 // 在循环入口创建，使用 `using` 关键字确保在所有退出路径上 dispose
@@ -280,7 +280,7 @@ using pendingMemoryPrefetch = startRelevantMemoryPrefetch(
 
 ### 2.4.1 流式处理与并行工具执行
 
-Claude Code 的流式处理不是简单的"等 API 返回再显示"。它利用 `StreamingToolExecutor` 实现了**流式工具并行执行**——在模型还在生成后续 token 时，已经完成解析的工具调用就被立即分发执行。这是 query() 循环内部的关键优化环节。
+Claude Code 对流式响应的用法不止于渲染。它利用 `StreamingToolExecutor` 实现了**流式工具并行执行**——在模型还在生成后续 token 时，已经完成解析的工具调用就立即分发执行。这是 query() 循环内部的关键优化环节。
 
 ```
                     API 流式输出
@@ -306,7 +306,7 @@ Claude Code 的流式处理不是简单的"等 API 返回再显示"。它利用 
 
 #### StreamingToolExecutor 实现原理
 
-`StreamingToolExecutor`（`src/services/tools/StreamingToolExecutor.ts`，530 行）的核心是一个带并发控制的工具执行队列。每个工具被追踪为 `queued → executing → completed → yielded` 四个状态：
+`StreamingToolExecutor`（`src/services/tools/StreamingToolExecutor.ts`，530 行）的核心是一个带并发控制的工具执行队列。每个工具沿 `queued → executing → completed → yielded` 四个状态流转：
 
 ```typescript
 // src/services/tools/StreamingToolExecutor.ts — 核心调度逻辑
@@ -340,16 +340,16 @@ private canExecuteTool(isConcurrencySafe: boolean): boolean {
 
 关键设计细节：
 
-1. **`addTool(block)`**：API 流式响应在解析到完整的 `tool_use` JSON block 时调用此方法。注意是"完整的 block"——不需要等整个 API 响应结束，一个 tool_use block 的 JSON 完成解析就可以分发执行
-2. **并发安全分类**：每个工具通过 `isConcurrencySafe` 声明是否可以并行。读文件、搜索等只读操作标记为 concurrent-safe，可以同时执行；写文件、Bash 命令等标记为非 concurrent，必须独占执行
-3. **Bash 错误级联**：当一个 Bash 工具出错时，`siblingAbortController` 会取消所有正在并行执行的兄弟工具——因为 Bash 命令之间经常有隐式依赖（如 `mkdir` 失败后续命令就没意义了），但读文件/搜索等独立操作的失败不会触发级联
-4. **`getCompletedResults()` + `getRemainingResults()`**：前者非阻塞地收割已完成结果，后者异步等待剩余执行中的工具。两者配合实现了"流式期间即时收割 + 流式结束后等待尾部"的模式
+1. `addTool(block)`：API 流式响应在解析到完整的 `tool_use` JSON block 时调用此方法。注意是"完整的 block"——不需要等整个 API 响应结束，一个 tool_use block 的 JSON 完成解析就可以分发执行
+2. 并发安全分类：每个工具通过 `isConcurrencySafe` 声明是否可以并行。读文件、搜索等只读操作标记为 concurrent-safe，可以同时执行；写文件、Bash 命令等标记为非 concurrent，必须独占执行
+3. Bash 错误级联：当一个 Bash 工具出错时，`siblingAbortController` 会取消所有正在并行执行的兄弟工具——因为 Bash 命令之间经常有隐式依赖（如 `mkdir` 失败后续命令就没意义了），但读文件/搜索等独立操作的失败不会触发级联
+4. `getCompletedResults()` + `getRemainingResults()`：前者非阻塞地收割已完成结果，后者异步等待剩余执行中的工具。两者配合实现了"流式期间即时收割 + 流式结束后等待尾部"的模式
 
-这种设计的效果是：在一个典型的 API 响应（5-30 秒的流式窗口）中，多个工具可以被分发和完成。到流式结束时，工具结果已经可用——消除了串行执行的瓶颈。
+这种设计的效果是：在一个典型的 API 响应（5-30 秒的流式窗口）中，多个工具就能分发并执行完毕。到流式结束时，工具结果已经可用——消除了串行执行的瓶颈。
 
 ## 2.6 Feature Flag 条件加载
 
-`query.ts` 使用了 **6 个** Feature Flag 条件加载模块，分散在文件头部的三个 `eslint-disable` 块中。其中前 4 个与上下文压缩和工具系统密切相关，是理解主循环的核心；后 2 个（`jobClassifier`、`taskSummaryModule`）分别服务于模板分类和后台会话摘要，属于辅助功能。
+`query.ts` 使用了 6 个 Feature Flag 条件加载模块，分散在文件头部的三个 `eslint-disable` 块中。其中前 4 个与上下文压缩和工具系统密切相关，是理解主循环的核心；后 2 个（`jobClassifier`、`taskSummaryModule`）分别服务于模板分类和后台会话摘要，属于辅助功能。
 
 ```typescript
 // —— 第一组：上下文压缩相关 ——
@@ -387,9 +387,9 @@ const taskSummaryModule = feature('BG_SESSIONS')
 | `BG_SESSIONS` | `taskSummaryModule` | 后台会话任务摘要生成 |
 
 这个模式有三个层次：
-1. **编译时消除**：`feature()` 在 Bun bundler 构建时被求值。外部构建中 `feature('REACTIVE_COMPACT')` 返回 `false`，整个 `require()` 分支被 tree-shaking
-2. **类型安全**：`as typeof import(...)` 让 TypeScript 知道模块的完整类型，IDE 补全和类型检查不受影响
-3. **运行时守卫**：代码中使用 `if (contextCollapse) { contextCollapse.applyCollapsesIfNeeded(...) }`，这个 null 检查在编译时也被消除
+1. 编译时消除：`feature()` 在 Bun bundler 构建时求值。外部构建中 `feature('REACTIVE_COMPACT')` 返回 `false`，整个 `require()` 分支被 tree-shaking
+2. 类型安全：`as typeof import(...)` 让 TypeScript 知道模块的完整类型，IDE 补全和类型检查不受影响
+3. 运行时守卫：代码中使用 `if (contextCollapse) { contextCollapse.applyCollapsesIfNeeded(...) }`，编译时也会把这个 null 检查一并消除
 
 ## 2.7 七个继续点（Continue Sites）
 
@@ -431,11 +431,11 @@ flowchart TD
 
 ## 2.8 错误扣留策略（Withholding）
 
-这是 Claude Code 最巧妙的设计之一：**可恢复的错误不立即 yield 给上层**。
+这是 Claude Code 里相当巧妙的一处设计：**可恢复的错误不立即 yield 给上层**。
 
 ### 工作原理
 
-当出现 `prompt_too_long` 或 `max_output_tokens` 错误时，query() 不会立即通知调用方。它将错误推入 `assistantMessages` 但保留引用，然后运行恢复检查。如果恢复成功，错误**永远不会暴露给调用者**（包括 SDK 消费者和桌面应用），用户完全感知不到中间的错误。
+当出现 `prompt_too_long` 或 `max_output_tokens` 错误时，query() 不会立即通知调用方。它将错误推入 `assistantMessages` 但保留引用，然后运行恢复检查。如果恢复成功，错误永远不会暴露给调用者（包括 SDK 消费者和桌面应用），用户完全感知不到中间的错误。
 
 ```typescript
 // src/query.ts — 错误扣留检测函数
@@ -450,13 +450,13 @@ function isWithheldMaxOutputTokens(
 
 假设模型正在编辑一个大文件，生成了 16,000 Token 的输出后被 `max_output_tokens` 截断：
 
-1. **错误发生**：API 返回 `stop_reason: 'max_output_tokens'`
-2. **扣留而非暴露**：错误被包装为 `AssistantMessage`（带 `apiError: 'max_output_tokens'`），推入消息列表但**不 yield** 给调用方
-3. **恢复策略 1 — 升级**：检查是否可以升级到 `ESCALATED_MAX_TOKENS`（64K）。如果可以，直接用更大的 Token 限制重试，不注入任何用户消息
-4. **恢复策略 2 — 续写**：如果升级不可用或已经用过，注入一条 meta 用户消息 `"Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."` 让模型从断点继续，最多重试 3 次
-5. **成功恢复**：如果恢复成功，那条被扣留的错误消息永远不会 yield——SDK 消费者（如桌面应用）看不到任何错误，用户感知到的是一次流畅的响应
+1. 错误发生：API 返回 `stop_reason: 'max_output_tokens'`
+2. 扣留而非暴露：错误包装成一条 `AssistantMessage`（带 `apiError: 'max_output_tokens'`），推入消息列表但不 yield 给调用方
+3. 恢复策略 1 — 升级：检查是否可以升级到 `ESCALATED_MAX_TOKENS`（64K）。如果可以，直接用更大的 Token 限制重试，不注入任何用户消息
+4. 恢复策略 2 — 续写：如果升级不可用或已经用过，注入一条 meta 用户消息 `"Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."` 让模型从断点继续，最多重试 3 次
+5. 成功恢复：如果恢复成功，那条扣下的错误消息永远不会 yield——SDK 消费者（如桌面应用）看不到任何错误，用户感知到的是一次流畅的响应
 
-只有当所有恢复尝试都失败时（升级不可用 + 3 次续写都失败），错误才会被 yield 给上层。
+只有当所有恢复尝试都失败时（升级不可用 + 3 次续写都失败），错误才 yield 给上层。
 
 ### 为什么这么设计？
 
@@ -483,7 +483,7 @@ const EMPTY_USAGE = {
 ```
 
 追踪机制：
-- 每条 API 响应的 `message_delta` 事件中，`currentMessageUsage` 被更新
+- 每条 API 响应的 `message_delta` 事件都会更新 `currentMessageUsage`
 - `message_stop` 时，`currentMessageUsage` 通过 `accumulateUsage()` 累加到 `totalUsage`
 - `getTotalCost()` 基于 `totalUsage` 和模型定价计算 USD 总成本
 - 一旦 `getTotalCost() >= maxBudgetUsd`，整个查询终止——这是防止意外高成本的安全机制
@@ -494,28 +494,28 @@ const EMPTY_USAGE = {
 
 循环在以下条件下终止：
 
-1. **模型未调用工具**：返回纯文本响应，正常结束
-2. **达到最大轮次**：`maxTurns` 限制
-3. **USD 预算超限**：`getTotalCost() >= maxBudgetUsd`
-4. **用户中断**：`abortController.signal` 被触发
-5. **不可恢复的错误**：PTL/MOT 恢复全部失败
+1. 模型未调用工具：返回纯文本响应，正常结束
+2. 达到最大轮次：`maxTurns` 限制
+3. USD 预算超限：`getTotalCost() >= maxBudgetUsd`
+4. 用户中断：`abortController.signal` 触发
+5. 不可恢复的错误：PTL/MOT 恢复全部失败
 
 > **设计决策：连续压缩失败的熔断器为什么阈值是 3 次？**
 >
-> `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`（`src/services/compact/autoCompact.ts`）。源码注释引用了生产数据：*"BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally."* 没有这个熔断器之前，压缩一旦进入失败循环，会在每一轮都白白发起一次完整的摘要 API 调用（其输出上限 `MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20K` tokens，并非每次都真的消耗这么多）。注意熔断器**不会直接终止主循环**：连续失败 3 次后，`checkAutoCompact` 对本会话后续的 autocompact 尝试直接返回 `{ wasCompacted: false }`（压缩变成 no-op），`query()` 拿到失败计数只更新 tracking，随即继续往下迭代；如果上下文最终仍然超限，是经由上面第 5 条（PTL/MOT 恢复全部失败）才真正终止。3 次阈值在"给压缩服务恢复机会"和"避免资源浪费"之间取得平衡。
+> `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`（`src/services/compact/autoCompact.ts`）。源码注释引用了生产数据：*"BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally."* 没有这个熔断器之前，压缩一旦进入失败循环，会在每一轮都白白发起一次完整的摘要 API 调用；这种调用的输出上限是 `MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20K` tokens，并非每次都真的消耗这么多。注意熔断器不会直接终止主循环：连续失败 3 次后，`checkAutoCompact` 对本会话后续的 autocompact 尝试直接返回 `{ wasCompacted: false }`，压缩变成 no-op；`query()` 拿到失败计数只更新 tracking，随即继续往下迭代。如果上下文最终仍然超限，要经由上面第 5 条——PTL/MOT 恢复全部失败——才真正终止。3 次阈值在"给压缩服务恢复机会"和"避免资源浪费"之间取得平衡。
 
 > **设计决策：为什么用异步生成器而不是回调/事件？**
 >
-> `query()` 是一个 `async function*`，通过 `yield` 逐步输出事件。相比回调模式（如 EventEmitter），生成器有两个关键优势：（1）**背压控制**——消费端不处理完上一个事件，生产端不会继续执行，天然防止事件堆积；（2）**线性控制流**——循环的 7 个 continue site 可以用普通的 `state = { ... }; continue` 表达，不需要状态机的显式转换表。代价是调用方必须用 `for await...of` 消费，但在 Claude Code 中只有 QueryEngine 是消费者，这个约束完全可接受。
+> `query()` 是一个 `async function*`，通过 `yield` 逐步输出事件。相比 EventEmitter 这类回调模式，生成器有两个关键优势。一是背压控制：消费端不处理完上一个事件，生产端不会继续执行，天然防止事件堆积。二是线性控制流：循环的 7 个 continue site 可以用普通的 `state = { ... }; continue` 表达，不需要状态机的显式转换表。代价是调用方必须用 `for await...of` 消费，但在 Claude Code 中只有 QueryEngine 是消费者，这个约束完全可接受。
 
 ## 2.11 设计亮点总结
 
-1. **双层生成器分离关注点**：QueryEngine 管会话生命周期，query() 管单次循环
-2. **流式工具并行执行**：利用 API 流式窗口覆盖工具延迟
-3. **错误扣留保证用户无感知恢复**：可恢复错误不暴露给上层
-4. **7 个精确的继续点**：每种恢复策略都有明确的 transition 标记，可测试、可追踪
-5. **编译时 Feature Gate**：内部功能在外部构建中被物理移除
-6. **Task Budget 跨压缩结转**：压缩前后的 Token 预算无缝衔接
+1. 双层生成器分离关注点：QueryEngine 管会话生命周期，query() 管单次循环
+2. 流式工具并行执行：利用 API 流式窗口覆盖工具延迟
+3. 错误扣留保证用户无感知恢复：可恢复错误不暴露给上层
+4. 7 个精确的继续点：每种恢复策略都有明确的 transition 标记，可测试、可追踪
+5. 编译时 Feature Gate：内部功能从外部构建中物理移除
+6. Task Budget 跨压缩结转：压缩前后的 Token 预算无缝衔接
 
 ---
 
