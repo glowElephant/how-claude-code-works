@@ -33,6 +33,8 @@
   - [17. 自治与续跑：/goal 与 /loop](/docs/17-autonomy-goal-loop.md)
   - [18. Auto Mode：权限进入分类器时代](/docs/18-auto-mode.md)
   - [19. Dynamic Workflows：确定性脚本编排 agent 舰队](/docs/19-dynamic-workflows.md)
+  - [20. Agent Teams：对等组队与跨会话安全](/docs/20-agent-teams.md)
+  - [21. 后台 Agent 舰队：脱终端常驻与 daemon 监管](/docs/21-background-fleet.md)
 
 - **参考**
   - [速查参考](/docs/reference.md)
