@@ -540,6 +540,38 @@ return { messages } // 原样返回！
 
 两条路径互斥：时间触发优先级更高，如果时间触发生效，会跳过缓存编辑路径（因为缓存已冷，使用 `cache_edits` 没有意义）。
 
+**路径 C：API 端原生 context management**
+
+除了上面两条客户端路径，`src/services/compact/apiMicrocompact.ts` 还提供一条**让 API 自己清理**的路径——不在客户端动消息，而是在请求体里塞 `context_management.edits` 策略数组，让服务端在打 prefix cache 时顺便做清理。
+
+两条独立策略：
+
+| 策略 | 默认启用范围 | 何时触发 | 行为 |
+|---|---|---|---|
+| `clear_thinking_20251015` | 所有有 thinking 的请求 | 每次请求都声明 | `keep: 'all'`（默认）保留所有 thinking；`keep: { thinking_turns: 1 }` 仅留最近一轮 |
+| `clear_tool_uses_20250919` | 仅 Anthropic 内部员工（`USER_TYPE='ant'`），需 `USE_API_CLEAR_TOOL_RESULTS`/`USE_API_CLEAR_TOOL_USES` env 开 | `input_tokens > 180K`（`API_MAX_INPUT_TOKENS` 可覆盖） | 清旧 `tool_result` 内容或旧 `tool_use` 本体，`clear_at_least` 至少清出 140K |
+
+`clearAllThinking=true` 何时 latch？`src/services/api/claude.ts:1446-1455`：
+
+```typescript
+let thinkingClearLatched = getThinkingClearLatched() === true
+if (!thinkingClearLatched && isAgenticQuery) {
+  const lastCompletion = getLastApiCompletionTimestamp()
+  if (lastCompletion !== null && Date.now() - lastCompletion > CACHE_TTL_1HOUR_MS) {
+    thinkingClearLatched = true
+    setThinkingClearLatched(true)
+  }
+}
+```
+
+注释直白地道出意图——**距上次 API 完成超过 1h，cache TTL 必过期，prefix 反正要重写，趁机多清点 thinking blocks**。一旦 latch 上，整个会话都保持该状态（与 3.6 第二层的 sticky-on latch 一脉相承——避免 cache key 中途翻转）。
+
+> 设计决策：为什么 `clear_tool_uses_20250919` 要设置 `clear_at_least: 140K`？
+>
+> 官方文档的 [Context editing 说明](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) 明确指出：*Tool result clearing invalidates cached prompt prefixes when content is cleared. To account for this, clear enough tokens to make the cache invalidation worthwhile.* 清理工具结果会直接破坏 prompt cache 前缀——这意味着本次请求的缓存写入成本（cache_creation_input_tokens）必然发生。如果只清掉几千 token，付出了一整次缓存重写的代价却没换回多少上下文空间，得不偿失。`clear_at_least: 140K` 确保每次触发都清出足够量（180K 触发阈值 − 40K 目标 = 140K），让缓存失效的代价换来实质性的空间收益。
+>
+> 与此形成对比的是 `clear_thinking_20251015`：官方文档说明 *When thinking blocks are kept in context, the prompt cache is preserved*——保留 thinking blocks 不破坏缓存，所以不需要 `clear_at_least` 约束。但当 thinking blocks 被清除（`clearAllThinking=true`，即 `keep: { thinking_turns: 1 }`）时同样会破坏缓存，只是那时已经是 1h idle 等到 cache TTL 过期后才触发，缓存反正要重写，所以也不需要特别保底。
+
 #### Level 4: Context Collapse
 
 投影式上下文折叠——关键特性是它不修改原始消息。它创建消息的折叠视图，将不重要的早期消息替换为摘要。这使得折叠可以跨轮次持久化，且可以在需要时回退。
@@ -561,6 +593,28 @@ if (feature('CONTEXT_COLLAPSE') && contextCollapse) {
 #### Level 5: Autocompact
 
 这是最后的手段——当所有轻量级压缩都无法将 Token 使用量控制在安全范围内时，系统 fork 一个子 Agent 来生成整个对话的摘要。
+
+但是"最后手段"也有两条子路径——按代价由低到高：
+
+**5a. Session Memory Compact（省去压缩时刻的 LLM 调用）**：`src/services/compact/sessionMemoryCompact.ts` 的 `trySessionMemoryCompaction` 在 `compactConversation` 之前先尝试用 Session Memory 文件替代"老消息的摘要"。需要 Anthropic 通过 GrowthBook（Anthropic 内部使用的 feature flag 服务，类似 LaunchDarkly）同时开启两个 flag：`tengu_session_memory`（控制是否生成 Session Memory 文件）和 `tengu_sm_compact`（控制是否将该文件用于压缩替代）。这是 Anthropic 服务端的灰度策略，用户无法自行开启，但源码中用 `ENABLE_CLAUDE_CODE_SM_COMPACT` / `DISABLE_CLAUDE_CODE_SM_COMPACT` 环境变量提供了手动覆盖（仅测试用）。
+
+> 注意命名歧义：**Session Memory ≠ 持久记忆系统（memdir/MEMORY.md）**。Session Memory 的路径是 `{projectDir}/{sessionId}/session-memory/summary.md`——**带 sessionId，只在本会话生效**；memdir 才是 `~/.claude/projects/{slug}/memory/MEMORY.md` 那种跨会话持久化。两者都叫 "memory" 但完全独立：memdir 是跨 session 长期事实存储，session memory 是当前会话持续维护的结构化工作笔记。
+
+Session Memory 由后台 fork agent 周期性抽取，写入一个固定 10 section 的 markdown 模板（`# Current State` / `# Task specification` / `# Files and Functions` / `# Errors & Corrections` / `# Learnings` / `# Worklog` 等，见 `src/services/SessionMemory/prompts.ts`）。触发抽取的条件（`src/services/SessionMemory/sessionMemoryUtils.ts:32-38`）：上下文 ≥10K token 才初始化、之后每 ≥5K token 增长 + ≥3 次工具调用才更新一次——保证后台 fork agent 不喧宾夺主。
+
+5a 子路径的输出：保留尾部 10K~40K token 原文 + 把前面段用 `summary.md` 内容包成 `isCompactSummary` 消息替代。`sessionMemoryCompactConfig` 默认值：
+
+```typescript
+minTokens: 10_000,        // 至少保留 10K token 的最近消息原文
+minTextBlockMessages: 5,  // 至少 5 条含文本块的消息
+maxTokens: 40_000,        // 最多保留 40K
+```
+
+`adjustIndexToPreserveAPIInvariants` 还会修正 startIndex：(1) 不切散 `tool_use`/`tool_result` 配对（orphan tool_result 会 422）；(2) 不切散 streaming 阶段同 `message.id` 但不同 uuid 的 thinking + tool_use（合并后丢 thinking）。
+
+回退守卫：如果 summary.md 还是初始模板从未填充过，`src/services/compact/sessionMemoryCompact.ts:442-446` 直接回退到下面的 5b 全量 LLM 摘要路径。
+
+**5b. 全量 LLM 摘要（compactConversation）**：经典路径，下面的章节详解。
 
 触发条件（`shouldAutoCompact()`）——必须同时满足 5 个条件：
 
@@ -646,8 +700,8 @@ Autocompact 的风险是让模型"忘记"刚编辑的文件。系统会在压缩
 ```mermaid
 flowchart TD
     Trigger[Token >= 阈值] --> Guard[递归守卫检查<br/>不在compact查询源中]
-    Guard --> Memory[会话记忆压缩 实验性<br/>trySessionMemoryCompaction<br/>增量式摘要]
-    Memory --> Full[全量对话压缩<br/>compactConversation<br/>fork子Agent生成摘要]
+    Guard --> Memory["5a. Session Memory Compact<br/>trySessionMemoryCompaction<br/>用 summary.md 替代老消息摘要（省去压缩时刻的 LLM 调用）"]
+    Memory --> Full["5b. 全量 LLM 摘要<br/>compactConversation<br/>fork子Agent生成摘要"]
     Full --> Cleanup[压缩后清理<br/>runPostCompactCleanup]
     Cleanup --> R1[恢复最近5个文件<br/>每个<=5K Token]
     Cleanup --> R2[恢复已调用技能<br/><=25K Token]
